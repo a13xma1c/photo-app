@@ -102,6 +102,11 @@ class Widget:
         if self.panel is not None:
             self.panel.invalidate()
 
+    def request_layout(self) -> None:
+        """Ask the owning panel to lay its content out again (children were added or removed, sizes changed)."""
+        if self.panel is not None:
+            self.panel.request_layout()
+
     # drawing ----------------------------------------------------------------
     def draw(self, img: Image.Image, ctx: DrawContext) -> None:
         for child in self.children():
@@ -148,11 +153,11 @@ class Column(Widget):
         if self.panel is not None:
             for w in widgets:
                 w.attach(self.panel)
-        self.invalidate()
+        self.request_layout()
 
     def clear(self) -> None:
         self._children.clear()
-        self.invalidate()
+        self.request_layout()
 
     def measure(self, width: int) -> int:
         visible = [c for c in self._children if c.visible]
@@ -190,11 +195,11 @@ class Row(Widget):
         if self.panel is not None:
             for w in widgets:
                 w.attach(self.panel)
-        self.invalidate()
+        self.request_layout()
 
     def clear(self) -> None:
         self._children.clear()
-        self.invalidate()
+        self.request_layout()
 
     def measure(self, width: int) -> int:
         if self._height is not None:
@@ -245,11 +250,11 @@ class FlowRow(Widget):
         if self.panel is not None:
             for w in widgets:
                 w.attach(self.panel)
-        self.invalidate()
+        self.request_layout()
 
     def clear(self) -> None:
         self._children.clear()
-        self.invalidate()
+        self.request_layout()
 
     def _lines(self, width: int) -> list[list[Widget]]:
         lines: list[list[Widget]] = [[]]
@@ -609,6 +614,17 @@ class Slider(Widget):
             int(text_width(self.fmt.format(int(hi) if integer else hi), self.value_font)),
             int(text_width(self.fmt.format(int(lo) if integer else lo), self.value_font)),
         ) + px(8)
+
+    @staticmethod
+    def align(sliders: Sequence[Slider]) -> None:
+        """Give stacked compact sliders the same label and value columns so their tracks line up."""
+        compact = [s for s in sliders if s.compact]
+        if not compact:
+            return
+        label_w = max(s._label_w for s in compact)
+        value_w = max(s._value_w for s in compact)
+        for s in compact:
+            s._label_w, s._value_w = label_w, value_w
 
     # geometry ----------------------------------------------------------------
     def _track(self) -> tuple[int, int, int]:
@@ -1390,6 +1406,37 @@ class LevelsEditor(Widget):
         self.reset()
 
 
+class BrushRow(Widget):
+    """A brush preset in the brush picker: stroke sample, name and a short description."""
+
+    cursor = "hand"
+
+    def __init__(self, name: str, description: str, sample: Image.Image, command: Callable[[], None], selected: bool = False) -> None:
+        super().__init__()
+        self.name, self.description, self.sample, self.command, self.selected = name, description, sample, command, selected
+        self.font = font(METRICS.font_size, "medium" if selected else "regular")
+        self.sub_font = font(METRICS.small_font_size)
+        self.height = px(52)
+
+    def draw(self, img: Image.Image, ctx: DrawContext) -> None:
+        x0, y0, x1, y1 = ctx.box(self)
+        if self.selected:
+            glass.fill_rounded(img, (x0, y0 + px(1), x1, y1 - px(1)), METRICS.control_radius - px(2), PALETTE.accent_soft)
+        elif ctx.is_hover(self):
+            glass.fill_rounded(img, (x0, y0 + px(1), x1, y1 - px(1)), METRICS.control_radius - px(2), PALETTE.fill)
+        cy = (y0 + y1) // 2
+        sample = self.sample
+        glass.paste(img, sample, (x0 + px(8), cy - sample.height // 2))
+        tx = x0 + px(8) + sample.width + px(12)
+        glass.text(img, (tx, cy - px(8)), glass.ellipsize(self.name, self.font, x1 - tx - px(8)), self.font, PALETTE.fg, "lm")
+        desc = glass.ellipsize(self.description, self.sub_font, x1 - tx - px(8))
+        glass.text(img, (tx, cy + px(9)), desc, self.sub_font, PALETTE.fg_muted, "lm")
+
+    def on_release(self, x: float, y: float, inside: bool) -> None:
+        if inside and self.enabled:
+            self.command()
+
+
 class ColorDot(Widget):
     """A small colour swatch (used in the info pill for the colour under the cursor)."""
 
@@ -1470,6 +1517,7 @@ class Panel:
         self.content_height = 0
         self._image: Image.Image | None = None
         self._dirty = True
+        self.needs_layout = False  # content changed: the surface re-runs layout() before the next render
         self._backdrop_key: object = None  # what the glass last blurred; set by the surface
         self.view: Any = None  # the owning Surface
         content.attach(self)
@@ -1500,6 +1548,7 @@ class Panel:
         return max(0, self.content_height - self.viewport_height)
 
     def layout(self, vw: int, vh: int) -> None:
+        self.needs_layout = False
         pad_x, pad_y = self.pad[0] + self.pad[2], self.pad[1] + self.pad[3]
         pref_w = self.content.preferred_width() + pad_x
         pref_h = self.content.measure(max(1, (pref_w if self.fit_width else 300) - pad_x)) + pad_y
@@ -1561,6 +1610,11 @@ class Panel:
         self._dirty = True
         if self.view is not None:
             self.view.panel_changed(self)
+
+    def request_layout(self) -> None:
+        """The content's structure changed (children added / removed): lay the panel out again before drawing."""
+        self.needs_layout = True
+        self.invalidate()
 
     @property
     def dirty(self) -> bool:
@@ -1650,10 +1704,15 @@ class LayerRow(Widget):
             parts.append("adjusted")
         if not effects_empty(self.layer.meta.get("effects")):
             parts.append("fx")
+        smart = len(self.layer.meta.get("filters") or [])
+        if smart:
+            parts.append(f"{smart} smart filter" + ("s" if smart != 1 else ""))
         if self.layer.kind == "text":
             parts.append("text")
         elif self.layer.kind == "adjustment":
             parts.append("adjustment")
+        elif self.layer.kind == "3d":
+            parts.append("3D")
         elif self.layer.kind == "group":
             parts.insert(0, f"{self.member_count} layers" if self.member_count != 1 else "1 layer")
         if self.layer.mask is not None and not self.layer.mask_enabled:

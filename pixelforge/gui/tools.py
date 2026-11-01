@@ -19,9 +19,12 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ..core import painting
+from ..core.brushes import BrushPreset
 from ..core.document import Document, DocumentError
 from ..core.painting import GRADIENT_TYPES, SHAPE_TYPES, Stroke, Transform
 from ..core.selection import COMBINE_MODES, Selection
+from ..core.three_d import SHAPES, Scene, bounding_box
+from ..core.three_d import render as render_scene
 from .i18n import tr
 from .surface import Layer, PointerEvent, Surface
 from .theme import PALETTE, px, text_width
@@ -88,6 +91,8 @@ class Tool:
     cursor = "arrow"
     hint = ""
     has_cursor_layer = False
+    options_follow_layer = False  # rebuild the options bar when the active layer changes
+    edits_smart_layers = False  # may work on 3D / text layers (whose pixels are re-rendered from settings)
 
     def __init__(self, app: Editor) -> None:
         self.app = app
@@ -154,6 +159,10 @@ class Tool:
             return False
         if doc.active_layer.kind == "group" and not doc.editing_mask:
             self.app.notify(tr("A group has no pixels - select a layer inside it"))
+            return False
+        if doc.is_smart() and not doc.editing_mask and not self.edits_smart_layers:
+            what = tr("3D object") if doc.active_layer.kind == "3d" else tr("text layer")
+            self.app.notify(tr("This is a {what} - rasterize it (Layer ▸ Rasterize Layer) to paint on its pixels").format(what=what))
             return False
         return True
 
@@ -434,6 +443,7 @@ class CropTool(Tool):
 class MoveTool(Tool):
     id, name, icon, key, cursor = "move", "Move", "move", "v", "move"
     hint = "Drag to move the layer · arrow keys nudge (Shift: 10 px)"
+    edits_smart_layers = True
 
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -516,6 +526,7 @@ class TransformTool(Tool):
     id, name, icon, key, cursor = "transform", "Free Transform", "transform", "", "arrow"
     shortcut_label = "Mod+T"
     hint = "Drag handles to scale (Shift keeps the aspect) · drag outside a corner to rotate · drag inside to move · Enter applies"
+    edits_smart_layers = True
     ROTATE_REACH = 26  # device pixels beyond a corner handle that still rotate
 
     def __init__(self, app: Editor) -> None:
@@ -962,23 +973,52 @@ class BrushTool(Tool):
     hint = "Paint with the foreground colour · [ and ] change the size · Shift-click for straight lines"
     has_cursor_layer = True
     erase = False
+    default_preset = "Hard Round"
 
-    def __init__(self, app) -> None:
+    def __init__(self, app: Editor) -> None:
         super().__init__(app)
-        self.options = {"size": 24, "hardness": 80, "opacity": 100}
+        self.preset: BrushPreset = app.brushes.get(self.default_preset)
+        self.options = {"size": self.preset.size, "hardness": self.preset.hardness, "opacity": 100, "flow": self.preset.flow}
         self._stroke: Stroke | None = None
         self._base: Image.Image | None = None
         self._preview: Image.Image | None = None
         self._last_point: tuple[float, float] | None = None
         self._size_slider: Slider | None = None
+        self._brush_button: Button | None = None
 
     def build_options(self) -> list[Widget]:
         self._size_slider = _option_slider(tr("Size"), 1, 500, self.options, "size", width=200)
+        self._brush_button = Button(self.preset.name, self.open_brushes, icon="brush", small=True, tooltip=tr("Brush presets and settings"))
         return [
+            self._brush_button,
             self._size_slider,
-            _option_slider(tr("Hardness"), 0, 100, self.options, "hardness", width=180),
-            _option_slider(tr("Opacity"), 1, 100, self.options, "opacity", width=180),
+            _option_slider(tr("Hardness"), 0, 100, self.options, "hardness", width=170),
+            _option_slider(tr("Opacity"), 1, 100, self.options, "opacity", width=170),
+            _option_slider(tr("Flow"), 1, 100, self.options, "flow", width=150),
         ]
+
+    def open_brushes(self) -> None:
+        from . import sheets
+
+        sheets.brush_sheet(self.app, self)
+
+    def current_preset(self) -> BrushPreset:
+        """The preset as the options bar has tuned it (size, hardness and flow live in the options)."""
+        return replace(
+            self.preset, size=int(self.options["size"]), hardness=int(self.options["hardness"]), flow=int(self.options["flow"])
+        ).normalized()
+
+    def set_preset(self, preset: BrushPreset) -> None:
+        """Switch to *preset*: its size, hardness and flow become the options bar values."""
+        self.preset = preset
+        self.options.update(size=preset.size, hardness=preset.hardness, flow=preset.flow)
+        if self._size_slider is not None:
+            self._size_slider.set(preset.size)
+        if self._brush_button is not None:
+            self._brush_button.text = preset.name
+            self._brush_button.invalidate()
+        self.app.refresh_tool_options()
+        self.view.schedule(0)
 
     def _color(self):
         return self.app.foreground
@@ -987,7 +1027,7 @@ class BrushTool(Tool):
         if not self._editable():
             return
         target = self.doc.edit_image()  # the layer's pixels, or its mask while the mask is being edited
-        self._stroke = Stroke(self.doc.size, self.options["size"], self.options["hardness"] / 100)
+        self._stroke = Stroke(self.doc.size, preset=self.current_preset())
         self._base = target
         self._preview = target.copy()
         if e.shift and self._last_point is not None:
@@ -1059,8 +1099,11 @@ class BrushTool(Tool):
         img = Image.new("RGBA", (d, d), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         c = d / 2
-        draw.ellipse((c - radius - 1, c - radius - 1, c + radius + 1, c + radius + 1), outline=(0, 0, 0, 150), width=max(1, px(1)))
-        draw.ellipse((c - radius, c - radius, c + radius, c + radius), outline=(255, 255, 255, 230), width=max(1, px(1)))
+        ry = max(1.0, radius * self.preset.roundness / 100)  # the outline mirrors the tip's roundness and angle
+        for extra, color in ((1, (0, 0, 0, 150)), (0, (255, 255, 255, 230))):
+            draw.ellipse((c - radius - extra, c - ry - extra, c + radius + extra, c + ry + extra), outline=color, width=max(1, px(1)))
+        if self.preset.angle % 180 > 1e-6 and self.preset.roundness < 100:
+            img = img.rotate(self.preset.angle, resample=Image.Resampling.BILINEAR)
         wx, wy = view.pointer
         return ("cursor", int(wx - c), int(wy - c), img)
 
@@ -1076,9 +1119,11 @@ class CloneTool(BrushTool):
     hint = "Alt-click to set the source, then paint · [ and ] change the size"
     heal = False
 
+    default_preset = "Soft Round"
+
     def __init__(self, app: Editor) -> None:
         super().__init__(app)
-        self.options = {"size": 40, "hardness": 60, "opacity": 100, "aligned": True, "merged": True}
+        self.options.update(size=40, hardness=60, aligned=True, merged=True)
         self.source_point: tuple[float, float] | None = None  # where the user Alt-clicked (document coordinates)
         self._source: Image.Image | None = None  # pixels sampled when the stroke began
         self._offset: tuple[int, int] | None = None  # destination → source offset of the current / aligned stroke
@@ -1372,6 +1417,153 @@ class ShapeTool(Tool):
             self.view.invalidate_frame()
 
 
+# -------------------------------------------------------------------- 3D --
+class ThreeDTool(Tool):
+    """Rotate (drag), move (Shift-drag) and scale (Alt-drag) the 3D object of the active layer."""
+
+    id, name, icon, key, cursor = "3d", "3D", "cube", "k", "move"
+    hint = "Drag to rotate the 3D object · Shift-drag moves · Alt-drag scales · double-click for all settings"
+    edits_smart_layers = True
+    options_follow_layer = True
+    PREVIEW_SCALE = 0.5
+
+    def __init__(self, app: Editor) -> None:
+        super().__init__(app)
+        self.options = {"wireframe": False}
+        self._start: tuple[float, float] | None = None
+        self._mode = "rotate"
+        self._origin: Scene | None = None
+        self._pending: Scene | None = None
+        self._generation = 0
+
+    def _scene(self) -> Scene | None:
+        return self.doc.scene_of() if self.app.doc is not None else None
+
+    def build_options(self) -> list[Widget]:
+        scene = self._scene()
+        widgets: list[Widget] = [Button(tr("3D Settings…"), self.open_settings, icon="cube", small=True)]
+        if scene is not None:
+            shapes = [sh for sh in SHAPES if sh != "extrusion"]
+            current = shapes.index(scene.shape) if scene.shape in shapes else 0
+            widgets.append(Segmented([tr(sh.title()) for sh in shapes], current, self._pick_shape, width=420))
+            self.options["wireframe"] = scene.wireframe
+            widgets.append(_option_toggle(tr("Wireframe"), self.options, "wireframe", 120))
+            toggle = widgets[-1]
+            assert isinstance(toggle, Toggle)
+            toggle.command = self._toggle_wireframe
+        return widgets
+
+    def _pick_shape(self, index: int) -> None:
+        shapes = [sh for sh in SHAPES if sh != "extrusion"]
+        if self._scene() is None:
+            return
+        self.app.doc_op(lambda d: d.update_3d_layer(shape=shapes[index], label="3D Shape"))
+
+    def _toggle_wireframe(self, value: bool) -> None:
+        self.options["wireframe"] = value
+        if self._scene() is not None:
+            self.app.doc_op(lambda d: d.update_3d_layer(wireframe=value, label="3D Wireframe"))
+
+    def open_settings(self) -> None:
+        from . import sheets
+
+        if self.app.doc is None:
+            return
+        if self._scene() is None:
+            self.app.notify(tr("Select a 3D layer, or add one with Layer ▸ New 3D Object…"))
+            return
+        sheets.three_d_sheet(self.app, self.doc.active_index)
+
+    # interaction -------------------------------------------------------------
+    def on_press(self, e: PointerEvent) -> None:
+        scene = self._scene()
+        if scene is None:
+            if self.app.doc is not None:
+                self.app.notify(tr("Select a 3D layer, or add one with Layer ▸ New 3D Object…"))
+            return
+        if not self._editable():
+            return
+        self._start = (e.x, e.y)
+        self._origin = scene
+        self._mode = "move" if e.shift else "scale" if e.alt else "rotate"
+
+    def on_drag(self, e: PointerEvent) -> None:
+        if self._start is None or self._origin is None:
+            return
+        dx, dy = e.x - self._start[0], e.y - self._start[1]
+        o = self._origin
+        if self._mode == "move":
+            scene = replace(o, position=(o.position[0] + dx, o.position[1] + dy))
+        elif self._mode == "scale":
+            scene = replace(o, size=max(4.0, o.size * (1 + dx / 200.0)))
+        else:
+            rx, ry, rz = o.rotation
+            scene = replace(o, rotation=(rx + dy * 0.5, ry + dx * 0.5, rz))
+        self._pending = scene.normalized()
+        self._preview(self._pending)
+
+    def _preview(self, scene: Scene) -> None:
+        """Render a quick half-resolution preview on the worker; only the newest result is shown."""
+        doc = self.doc
+        layer_id = doc.active_layer.id
+        self._generation += 1
+        generation = self._generation
+        size = doc.size
+
+        def job() -> Image.Image:
+            small = render_scene(scene, size, supersample=1, scale=self.PREVIEW_SCALE)
+            return small.resize(size, Image.Resampling.BILINEAR)
+
+        def show(image: Image.Image) -> None:
+            if generation == self._generation and self.app.doc is doc and doc.active_layer.id == layer_id:
+                self.app.begin_preview(layer_id, image)
+
+        self.app.worker.submit("3d-preview", job, show)
+
+    def on_release(self, e: PointerEvent) -> None:
+        pending, self._pending = self._pending, None
+        self._start = self._origin = None
+        self._generation += 1
+        self.app.worker.cancel("3d-preview")
+        self.app.end_preview()
+        if pending is None:
+            return
+        self.app.doc_op(
+            lambda d: d.update_3d_layer(scene=pending, label="Rotate 3D Object" if self._mode == "rotate" else "Move 3D Object")
+        )
+
+    def on_double(self, e: PointerEvent) -> None:
+        self.open_settings()
+
+    def on_key(self, keysym: str, mods: frozenset[str] = frozenset()) -> bool:
+        scene = self._scene()
+        if scene is None:
+            return False
+        deltas = {"Left": (0, -15), "Right": (0, 15), "Up": (-15, 0), "Down": (15, 0)}
+        if keysym not in deltas:
+            return False
+        drx, dry = deltas[keysym]
+        rx, ry, rz = scene.rotation
+        self.app.doc_op(lambda d: d.update_3d_layer(rotation=(rx + drx, ry + dry, rz), label="Rotate 3D Object"))
+        return True
+
+    def paint_overlay(self, frame: Image.Image, view: Surface) -> Image.Image:
+        scene = self._pending or self._scene()
+        if scene is None or self.app.doc is None:
+            return frame
+        x0, y0, x1, y1 = bounding_box(scene, self.doc.size)
+        vx0, vy0 = view.to_view(x0, y0)
+        vx1, vy1 = view.to_view(x1, y1)
+        base = frame.convert("RGBA")
+        _dashed_rect(ImageDraw.Draw(base), (vx0, vy0, vx1, vy1))
+        return base.convert("RGB")
+
+    def cancel(self) -> None:
+        self._start = self._origin = self._pending = None
+        self._generation += 1
+        self.app.end_preview()
+
+
 # ------------------------------------------------------------ eyedropper --
 class EyedropperTool(Tool):
     id, name, icon, key, cursor = "eyedropper", "Eyedropper", "eyedropper", "i", "cross"
@@ -1413,6 +1605,7 @@ TOOL_CLASSES: tuple[type[Tool], ...] = (
     GradientTool,
     TextTool,
     ShapeTool,
+    ThreeDTool,
     EyedropperTool,
     ZoomTool,
     HandTool,

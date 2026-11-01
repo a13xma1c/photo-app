@@ -40,6 +40,19 @@ All notable changes to PixelForge are documented here. The format follows
 - **Packaging**: a PyInstaller spec and `packaging/build.py` produce a standalone app bundle.
 - **Development**: pre-commit configuration, Hypothesis property-based tests for blend modes,
   selection algebra, curves, transforms and history patches.
+- **Brush engine and presets**: tip shapes (round, square, chalk, spatter, custom tips defined
+  from a selection), spacing, angle, roundness, scatter, size / opacity jitter, flow and dab
+  count; eleven built-in presets with stroke samples, user presets saved as JSON, a brush picker
+  in the options bar of the Brush, Eraser, Clone Stamp and Healing Brush.
+- **3D objects**: primitive meshes (cube, sphere, cylinder, cone, torus, pyramid) and textured
+  extrusions of any layer (3D text!), rendered by a NumPy z-buffer rasterizer with perspective,
+  Blinn-Phong shading, adjustable light, supersampling and wireframe; re-editable 3D layers,
+  a 3D tool (`K`) that rotates / moves / scales on the canvas with background previews, and a
+  settings sheet.
+- **Smart layers**: filters and curves applied to 3D and text layers are recorded as *smart
+  filters* and re-applied after every re-render, so moving, rotating or editing the object keeps
+  them; Move and Free Transform act on the object's settings; *Rasterize Layer* turns such a layer
+  into plain pixels, *Remove Smart Filters* clears the stack.
 
 ### Changed
 - The Layers tab's buttons are arranged in two rows (new: adjustment layer, group, mask, effects).

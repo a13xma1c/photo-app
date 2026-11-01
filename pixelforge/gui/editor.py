@@ -25,6 +25,7 @@ from .. import APP_NAME
 from ..core import io as pfio
 from ..core.adjustments import GROUPS, SLIDERS, auto_enhance, is_neutral
 from ..core.blend import BLEND_MODE_NAMES
+from ..core.brushes import BrushLibrary
 from ..core.document import Document, DocumentError
 from ..core.filters import CATEGORIES, FilterSpec, filters_in
 from ..core.layers import Layer, rgba_to_mask
@@ -83,6 +84,7 @@ SHORTCUTS: tuple[tuple[str, str], ...] = (
     ("V  M  L  W  C", "Move, Marquee, Lasso, Magic Wand, Crop"),
     ("B  E  G  Shift+G", "Brush, Eraser, Paint Bucket, Gradient"),
     ("S  J", "Clone Stamp, Healing Brush (Alt-click picks the source)"),
+    ("K", "3D tool: drag rotates · Shift moves · Alt scales"),
     ("T  U  I  Z  H", "Text, Shape, Eyedropper, Zoom, Hand"),
     ("[  /  ]", "Brush size"),
     ("X  /  D", "Swap / reset colours"),
@@ -184,8 +186,10 @@ class Editor:
         self.preview_overrides: dict[int, Image.Image] = {}
         self.preview_mask_overrides: dict[int, Image.Image] = {}
         self.collapsed_groups: set[int] = set()  # layer ids of groups folded in the Layers tab
+        self._options_layer_key: tuple[int, str] | None = None  # which layer the options bar was built for
         self.worker = Worker(shell.call_soon)  # heavy renders / previews run here, results come back on the GUI thread
         self.mask_overlay = bool(self.settings.get("mask_overlay", True))  # red tint over masked-out areas while editing a mask
+        self.brushes = BrushLibrary(self.config_dir / "brushes.json")
         self.tools: dict[str, Tool] = {cls.id: cls(self) for cls in TOOL_CLASSES}
         crop_tool = self.tools["crop"]
         assert isinstance(crop_tool, CropTool)
@@ -404,6 +408,39 @@ class Editor:
             Command("new-layer", tr("New Layer"), layer, lambda: op(lambda d: d.add_layer()), "Mod+Shift+N", has_doc),
             Command("new-adjustment", tr("New Adjustment Layer"), layer, lambda: op(lambda d: d.add_adjustment_layer()), "", has_doc),
             Command("group", tr("Group Layer"), layer, lambda: op(lambda d: d.group_active()), "Mod+G", has_doc),
+            Command("new-3d", tr("New 3D Object…"), layer, self.new_3d_object, "", has_doc),
+            Command(
+                "extrude-3d",
+                tr("Extrude Layer to 3D"),
+                layer,
+                lambda: op(lambda d: d.extrude_layer()),
+                "",
+                lambda: bool(self.doc and self.doc.active_layer.kind not in ("group", "adjustment", "3d")),
+            ),
+            Command(
+                "rasterize",
+                tr("Rasterize Layer"),
+                layer,
+                lambda: op(lambda d: d.rasterize_layer()),
+                "",
+                lambda: bool(self.doc and self.doc.is_smart()),
+            ),
+            Command(
+                "clear-smart-filters",
+                tr("Remove Smart Filters"),
+                layer,
+                lambda: op(lambda d: d.clear_smart_filters()),
+                "",
+                lambda: bool(self.doc and self.doc.smart_filters()),
+            ),
+            Command(
+                "edit-3d",
+                tr("Edit 3D Object…"),
+                layer,
+                lambda: self.edit_layer(None),
+                "",
+                lambda: bool(self.doc and self.doc.active_layer.kind == "3d"),
+            ),
             Command(
                 "ungroup",
                 tr("Ungroup"),
@@ -801,7 +838,8 @@ class Editor:
         def place(vw: int, vh: int, pw: int, ph: int) -> tuple[int, int, int, int]:
             w = min(px(width), vw - 2 * px(GAP))
             x = min(max(px(GAP), self._content_center_x(vw, vh) - w // 2), vw - w - px(GAP))
-            return x, max(px(GAP), (vh - ph) // 2 - px(30)), w, ph
+            h = min(ph, vh - 2 * px(GAP))  # tall (scrollable) sheets never run off the window
+            return x, max(px(GAP), (vh - h) // 2 - px(30)), w, h
 
         return place
 
@@ -1071,15 +1109,32 @@ class Editor:
         self.doc_op(lambda d: d.set_layer_props(locked=not d.active_layer.locked))
 
     def edit_layer(self, index: int | None) -> None:
-        """Double-click on a layer: edit text layers, rename others."""
+        """Double-click on a layer: edit text and 3D layers, rename others."""
         if self.doc is None:
             return
         index = self.doc.active_index if index is None else index
-        if self.doc.layers[index].kind == "text":
+        kind = self.doc.layers[index].kind
+        if kind == "text":
             self.doc.set_active(index)
             sheets.text_sheet(self, layer_index=index)
+        elif kind == "3d":
+            self.doc.set_active(index)
+            sheets.three_d_sheet(self, index)
         else:
             sheets.rename_layer_sheet(self, index)
+
+    def new_3d_object(self) -> None:
+        """Add a 3D cube above the active layer, switch to the 3D tool and open its settings."""
+        if self.doc is None:
+            return
+        try:
+            self.doc.add_3d_layer()
+        except DocumentError as exc:
+            self.notify(str(exc))
+            return
+        self.after_edit()
+        self.select_tool("3d")
+        sheets.three_d_sheet(self, self.doc.active_index, created=True)
 
     def open_blend_menu(self) -> None:
         if self.doc is None:
@@ -1126,6 +1181,11 @@ class Editor:
     # ---------------------------------------------------------- refresh --
     def refresh_all(self) -> None:
         has = self.doc is not None
+        if self.tool is not None and self.tool.options_follow_layer:
+            key = (self.doc.active_layer.id, self.doc.active_layer.kind) if self.doc is not None else None
+            if key != self._options_layer_key:
+                self._options_layer_key = key
+                self._show_tool_options()
         for panel in (self.strip, self.side, self.zoombar, self.infobar):
             panel.visible = has and not self._panels_hidden
         self.namebar.visible = has and not self._panels_hidden
@@ -1284,7 +1344,13 @@ class Editor:
         self.view.update_cursor()
         self.view.invalidate_frame()
 
+    def refresh_tool_options(self) -> None:
+        """Rebuild the options bar for the current tool (after a preset change)."""
+        self._show_tool_options()
+
     def _show_tool_options(self) -> None:
+        doc = self.doc
+        self._options_layer_key = (doc.active_layer.id, doc.active_layer.kind) if doc is not None else None
         self.options_row.clear()
         if self.tool is not None:
             widgets = self.tool.build_options()

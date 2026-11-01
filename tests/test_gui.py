@@ -2929,3 +2929,239 @@ def test_accessibility_tree_describes_the_interface(app_with_doc: Editor) -> Non
     accessibility.announce(widget, "hello")
     accessibility.focus_changed(widget)
     app.notify("spoken")
+
+
+def test_brush_picker_and_presets(app_with_doc: Editor) -> None:
+    app = app_with_doc
+    doc = doc_of(app)
+    app.select_tool("brush")
+    brush = tool_as(app, BrushTool)
+    assert brush.preset.name == "Hard Round" and brush.options["flow"] == 100
+    button = next(w for w in app.options_row.descendants() if isinstance(w, ui.Button))
+    assert button.text == "Hard Round"
+    fire(button)
+    sheet = sheet_of(app)
+    assert sheet.name == "brushes" and sheet.scrollable
+    rows = [w for w in sheet.content.descendants() if isinstance(w, ui.BrushRow)]
+    assert [r.name for r in rows][:3] == ["Hard Round", "Soft Round", "Airbrush"] and rows[0].selected
+    img = Image.new("RGBA", (420, 60))
+    rows[0].draw(img, ui.DrawContext(hover=rows[1]))
+    rows[1].draw(img, ui.DrawContext(hover=rows[1]))
+    assert sheet.rect[3] <= app.view.viewport_size()[1]  # a tall, scrollable sheet stays inside the window
+    # picking a preset with a real click retunes the tool (size / hardness / flow) and the options bar;
+    # the rebuilt rows are laid out again (they used to collapse to (0, 0) and blank the sheet)
+    airbrush = next(r for r in rows if r.name == "Airbrush")
+    click(app, sheet, airbrush)
+    app.view.render()
+    assert brush.preset.name == "Airbrush" and brush.options["size"] == 80 and brush.options["flow"] == 12
+    rows = [w for w in sheet_of(app).content.descendants() if isinstance(w, ui.BrushRow)]
+    assert all(r.rect[2] > r.rect[0] and r.rect[3] > r.rect[1] for r in rows) and rows[2].selected
+    assert rows[1].rect[1] < rows[2].rect[1] < rows[3].rect[1]
+    assert next(w for w in app.options_row.descendants() if isinstance(w, ui.Button)).text == "Airbrush"
+    # tuning a setting changes the live preset; the settings sliders' tracks are aligned
+    sliders = {s.label: s for s in sheet_of(app).content.descendants() if isinstance(s, ui.Slider)}
+    assert len({s._track()[0] for s in sliders.values()}) == 1
+    sliders["Scatter"].set(120, notify=True)
+    assert brush.preset.scatter == 120 and brush.current_preset().scatter == 120
+    seg = next(w for w in sheet_of(app).content.descendants() if isinstance(w, ui.Segmented))
+    seg.select(1)
+    assert brush.preset.tip == "square"
+    # the brush cursor reflects roundness / angle
+    sliders = {s.label: s for s in sheet_of(app).content.descendants() if isinstance(s, ui.Slider)}
+    sliders["Roundness"].set(30, notify=True)
+    sliders["Angle"].set(45, notify=True)
+    app.view.pointer = (200, 200)
+    layer = brush.cursor_layer(app.view)
+    assert layer is not None and layer[3].getbbox() is not None
+    # define a tip from the selection, save the result under a name, reload, delete
+    doc.set_selection(Selection.rectangle(doc.size, (10, 10, 60, 40)))
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Tip from selection"))
+    assert brush.preset.tip == "custom" and brush.preset.texture
+    field = next(w for w in sheet_of(app).content.descendants() if isinstance(w, ui.TextField))
+    field.set_text("")
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Save"))
+    assert "name" in app.info_label.text  # needs a name
+    field.set_text("Airbrush")
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Save"))
+    assert "built-in" in app.info_label.text
+    field.set_text("My Stamp")
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Save"))
+    assert "My Stamp" in app.brushes.names() and brush.preset.name == "My Stamp" and (app.config_dir / "brushes.json").exists()
+    rows = [w for w in sheet_of(app).content.descendants() if isinstance(w, ui.BrushRow)]
+    assert rows[-1].name == "My Stamp" and rows[-1].selected
+    # painting with the custom preset works (and is scattered/jittered deterministically per stroke)
+    press_key(app, "Return")
+    assert app.sheet is None
+    doc.deselect()
+    brush.on_press(ev(100, 100))
+    brush.on_drag(ev(200, 120))
+    brush.on_release(ev(200, 120))
+    assert doc.history.labels[-1] == "Brush Stroke"
+    fire(button) if button.command else None
+    brush.open_brushes()
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Delete"))
+    assert "My Stamp" not in app.brushes.names() and brush.preset.name == "Hard Round"
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Delete"))
+    assert "Built-in" in app.info_label.text
+    press_key(app, "Escape")
+    # the eraser and clone tools have their own presets
+    app.select_tool("eraser")
+    assert tool_as(app, BrushTool).preset.name == "Hard Round"
+    app.select_tool("clone")
+    assert tool_as(app, CloneTool).options["size"] == 40 and tool_as(app, CloneTool).preset.name == "Soft Round"
+    # "Tip from selection" needs pixels
+    doc.add_layer()
+    app.select_tool("brush")
+    brush.open_brushes()
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Tip from selection"))
+    assert "pixels" in app.info_label.text
+    press_key(app, "Escape")
+
+
+def test_3d_objects_in_the_gui(app_with_doc: Editor, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pixelforge.gui.tools import ThreeDTool
+
+    app = app_with_doc
+    doc = doc_of(app)
+    # the tool alone cannot do anything without a 3D layer
+    app.select_tool("3d")
+    tool = tool_as(app, ThreeDTool)
+    tool.on_press(ev(100, 100))
+    assert "3D layer" in app.info_label.text and tool._start is None
+    tool.open_settings()
+    assert app.sheet is None
+    assert not app.command("edit-3d").enabled() and app.command("extrude-3d").enabled()
+    # New 3D Object… adds a cube layer, selects the 3D tool and opens the settings sheet
+    app.command("new-3d").run()
+    assert doc.active_layer.kind == "3d" and app.tool is tool and sheet_of(app).name == "3d"
+    rows = [w for w in sheet_of(app).content.descendants() if isinstance(w, ui.Slider)]
+    assert [r.label for r in rows][:3] == ["Size", "Depth", "Rotate X"]
+    # stacked sliders share one label / value column, so every track starts and ends at the same x
+    assert len({r._track()[0] for r in rows}) == 1 and len({r._track()[1] for r in rows}) == 1
+    # angles are signed with 0° in the middle of the track (the default cube is at -20° / +30° / 0°)
+    by_label = {r.label: r for r in rows}
+    assert by_label["Rotate X"].value == -20 and by_label["Rotate Y"].value == 30 and by_label["Rotate Z"].value == 0
+    assert by_label["Rotate Z"]._fraction() == pytest.approx(0.5) and by_label["Light direction"].value == -40
+    rows[2].set(90, notify=True)
+    settle(app, 120)
+    assert app.preview_overrides  # quick preview rendered on the worker
+    seg = next(w for w in sheet_of(app).content.descendants() if isinstance(w, ui.Segmented))
+    seg.select(1)  # sphere
+    monkeypatch.setattr(shell_of(app), "ask_color", lambda initial: (255, 0, 0, 255))
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Pick…"))
+    settle(app, 120)
+    press_key(app, "Return")
+    scene = doc.scene_of()
+    assert scene is not None and scene.shape == "sphere" and scene.color == (255, 0, 0) and scene.rotation[0] == 90
+    assert doc.history.labels[-1] == "Edit 3D Object" and not app.preview_overrides
+    # the options bar shows the shape picker and wireframe toggle
+    seg = next(w for w in app.options_row.descendants() if isinstance(w, ui.Segmented))
+    seg.select(4)  # torus
+    assert doc.scene_of().shape == "torus"  # type: ignore[union-attr]
+    toggle = next(w for w in app.options_row.descendants() if isinstance(w, ui.Toggle))
+    toggle.on_release(1, 1, True)
+    assert doc.scene_of().wireframe and doc.history.labels[-1] == "3D Wireframe"  # type: ignore[union-attr]
+    # dragging rotates (preview on the worker, commit on release); Shift moves; Alt scales; arrows rotate
+    before = doc.scene_of()
+    assert before is not None
+    tool.on_press(ev(200, 150))
+    tool.on_drag(ev(260, 150))
+    settle(app, 0)
+    assert (
+        app.preview_overrides and tool._pending is not None and tool._pending.rotation[1] == pytest.approx((before.rotation[1] + 30) % 360)
+    )
+    app.view.render()  # dashed bounding box overlay
+    tool.on_release(ev(260, 150))
+    after = doc.scene_of()
+    assert after is not None and after.rotation[1] == pytest.approx((before.rotation[1] + 30) % 360) and not app.preview_overrides
+    assert doc.history.labels[-1] == "Rotate 3D Object"
+    tool.on_press(ev(200, 150, shift=True))
+    tool.on_drag(ev(210, 170))
+    tool.on_release(ev(210, 170))
+    assert doc.scene_of().position == (10.0, 20.0)  # type: ignore[union-attr]
+    tool.on_press(ev(200, 150, alt=True))
+    tool.on_drag(ev(300, 150))
+    tool.on_release(ev(300, 150))
+    assert doc.scene_of().size == pytest.approx(after.size * 1.5)  # type: ignore[union-attr]
+    assert tool.on_key("Left") and doc.scene_of().rotation[1] == pytest.approx((after.rotation[1] - 15) % 360)  # type: ignore[union-attr]
+    assert not tool.on_key("q")
+    tool.on_press(ev(200, 150))
+    tool.on_release(ev(200, 150))  # no drag: nothing committed
+    assert doc.history.labels[-1] == "Rotate 3D Object"
+    # cancelling the sheet of a freshly created object removes it again; double-click opens the sheet
+    count = len(doc.layers)
+    app.command("new-3d").run()
+    assert len(doc.layers) == count + 1
+    fire(next(b for b in sheet_of(app).content.descendants() if isinstance(b, ui.Button) and b.text == "Cancel"))
+    assert len(doc.layers) == count and app.sheet is None
+    tool.on_double(ev(0, 0))
+    assert sheet_of(app).name == "3d"
+    press_key(app, "Escape")
+    # extruding a text layer gives textured 3D text; the layer row labels 3D layers
+    doc.set_active(0)
+    doc.add_text_layer("Hi", (100, 100), "#ffaa00", None, 80)
+    app.command("extrude-3d").run()
+    assert doc.active_layer.kind == "3d" and doc.scene_of().shape == "extrusion"  # type: ignore[union-attr]
+    app.tabs.select(2)
+    rows3 = [w for w in app.tab_body.descendants() if isinstance(w, ui.LayerRow)]
+    assert "3D" in rows3[0].details()
+    rows3[0].on_double(rows3[0].rect[0] + 100, rows3[0].rect[1] + 10)
+    assert sheet_of(app).name == "3d"
+    press_key(app, "Escape")
+    tool.cancel()
+
+
+def test_slider_align_shares_columns() -> None:
+    short = ui.Slider("X", 0, 10, 0, 0, compact=True, fmt="{:d}")
+    long = ui.Slider("A much longer label", 0, 1000, 0, 0, compact=True, fmt="{:d} %")
+    plain = ui.Slider("Plain", 0, 10, 0, 0)  # not compact: untouched
+    for s in (short, long, plain):
+        s.layout(0, 0, 400, 30)
+    assert short._track()[0] != long._track()[0]
+    ui.Slider.align([short, long, plain])
+    assert short._track() == long._track() and plain._track()[0] == theme.px(8)
+    ui.Slider.align([plain])  # nothing compact: no-op
+
+
+def test_smart_layers_in_the_gui(app_with_doc: Editor) -> None:
+    from pixelforge.core.filters import FILTERS
+    from pixelforge.core.three_d import Scene
+
+    app = app_with_doc
+    doc = doc_of(app)
+    doc.add_3d_layer(Scene(shape="cube", size=120))
+    app.refresh_all()
+    # a filter on a 3D layer becomes a smart filter (shown in the layer row) and survives a drag with the 3D tool
+    sheets.filter_sheet(app, FILTERS["Gaussian Blur"])
+    press_key(app, "Return")
+    assert doc.smart_filters() and doc.history.labels[-1] == "Gaussian Blur"
+    app.tabs.select(2)
+    rows = [w for w in app.tab_body.descendants() if isinstance(w, ui.LayerRow)]
+    assert "1 smart filter" in rows[0].details()
+    app.select_tool("3d")
+    tool = tool_of(app)
+    tool.on_press(ev(200, 150))
+    tool.on_drag(ev(240, 150))
+    tool.on_release(ev(240, 150))
+    assert doc.smart_filters() and doc.history.labels[-1] == "Rotate 3D Object"
+    # painting on it is refused with a hint (no stroke, no traceback); the Move tool moves the object itself
+    app.select_tool("brush")
+    tool_of(app).on_press(ev(200, 150))
+    assert tool_as(app, BrushTool)._stroke is None and "Rasterize" in app.info_label.text
+    app.select_tool("fill")
+    tool_of(app).on_press(ev(200, 150))
+    assert "Rasterize" in app.info_label.text
+    app.select_tool("move")
+    tool_of(app).on_press(ev(200, 150))
+    tool_of(app).on_drag(ev(230, 160))
+    tool_of(app).on_release(ev(230, 160))
+    assert doc.scene_of().position == (30.0, 10.0) and doc.active_layer.kind == "3d"  # type: ignore[union-attr]
+    assert app.command("rasterize").enabled() and app.command("clear-smart-filters").enabled()
+    app.command("clear-smart-filters").run()
+    assert not doc.smart_filters() and not app.command("clear-smart-filters").enabled()
+    app.command("rasterize").run()
+    assert doc.active_layer.kind == "pixel" and not app.command("rasterize").enabled()
+    app.select_tool("brush")
+    tool_of(app).on_press(ev(200, 150))
+    tool_of(app).on_release(ev(200, 150))
+    assert doc.history.labels[-1] == "Brush Stroke"  # rasterized: painting works again

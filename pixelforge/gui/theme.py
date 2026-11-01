@@ -293,7 +293,7 @@ _SYMBOL_CANDIDATES = [
     "Arial Unicode",
     "LiberationSans-Regular",
 ]
-_glyph_cache: dict[tuple[int, str], bool] = {}
+_glyph_cache: dict[tuple[object, int, str], bool] = {}
 _notdef_cache: dict[int, bytes | None] = {}
 
 
@@ -313,7 +313,8 @@ def has_glyph(fnt: AnyFont, char: str) -> bool:
     """True when *fnt* can draw *char* (rather than a blank or the .notdef box)."""
     if not char or char.isspace():
         return True
-    key = (id(fnt), char)
+    # key on the font file and size, not the object: ids get reused once fonts are reloaded
+    key = (getattr(fnt, "path", None) or id(fnt), font_size(fnt), char)
     cached = _glyph_cache.get(key)
     if cached is None:
         try:

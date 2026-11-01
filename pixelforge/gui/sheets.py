@@ -8,6 +8,7 @@ keeps that module focused on state and commands.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -15,16 +16,21 @@ from typing import Any
 from PIL import Image
 
 from .. import APP_NAME, __version__
+from ..core import brushes as brushes_mod
 from ..core import curves as curves_mod
 from ..core import effects as effects_mod
+from ..core import three_d
+from ..core.brushes import BrushPreset
 from ..core.document import inscribed_box
 from ..core.filters import CATEGORIES, FILTERS, FilterSpec, filters_in
 from ..core.painting import system_fonts
 from ..core.presets import PRESETS
+from ..core.three_d import Scene
 from .i18n import tr
 from .theme import PALETTE, px
 from .ui import (
     AnchorPicker,
+    BrushRow,
     Button,
     ColorDot,
     Column,
@@ -941,6 +947,7 @@ def effects_sheet(editor) -> None:
         colour("stroke"),
         Spacer(10),
     ]
+    Slider.align([w for w in sections if isinstance(w, Slider)])
 
     def clear() -> None:
         for effect in fx.values():
@@ -980,6 +987,259 @@ def effects_sheet(editor) -> None:
     panel.on_dismiss = preview.restore  # type: ignore[attr-defined]
     editor.open_sheet(panel)
     preview.now()
+
+
+# ----------------------------------------------------------------- brushes --
+def brush_sample(preset: BrushPreset, size: tuple[int, int] = (120, 36)) -> Image.Image:
+    """A stroke sample of *preset* drawn in the theme's text colour (for the picker)."""
+    import numpy as np
+
+    cov = brushes_mod.stroke_preview(preset, size)
+    r, g, b, _a = PALETTE.fg
+    sample = Image.new("RGBA", size, (r, g, b, 0))
+    sample.putalpha(Image.fromarray(np.clip(cov * 255 + 0.5, 0, 255).astype(np.uint8), "L"))
+    return sample
+
+
+def brush_sheet(editor, tool) -> None:
+    """Brush presets and settings for a brush-like tool (brush, eraser, clone stamp, healing brush)."""
+    library: brushes_mod.BrushLibrary = editor.brushes
+    name = "brushes"
+    state: dict[str, Any] = {"preset": tool.current_preset()}
+    rows_column = Column()
+    settings_column = Column()
+    name_field = TextField(tr("Name"), state["preset"].name, field_width=200, max_length=40)
+
+    def select(preset: BrushPreset) -> None:
+        state["preset"] = preset
+        tool.set_preset(preset)
+        name_field.set_text(preset.name)
+        rebuild_rows()
+        rebuild_settings()
+
+    def rebuild_rows() -> None:
+        rows_column.clear()
+        current = state["preset"]
+        for preset in library.presets():
+            selected = preset.name == current.name
+            rows_column.add(BrushRow(preset.name, preset.description(), brush_sample(preset), partial(select, preset), selected))
+        rows_column.invalidate()
+
+    def tweak(**changes: Any) -> None:
+        state["preset"] = replace(state["preset"], **changes).normalized()
+        tool.set_preset(state["preset"])  # the list shows the saved presets, so it needs no rebuild here
+
+    def slider(key: str, label: str, lo: int, hi: int, fmt: str = "{:d}") -> Slider:
+        value = getattr(state["preset"], key)
+        widget = Slider(label, lo, hi, value, value, on_change=lambda v: tweak(**{key: int(v)}), fmt=fmt, compact=True)
+        return widget
+
+    def rebuild_settings() -> None:
+        settings_column.clear()
+        preset = state["preset"]
+        tip_names = [t for t in brushes_mod.TIPS if t != "custom" or preset.texture]
+        index = tip_names.index(preset.tip) if preset.tip in tip_names else 0
+        sliders = [
+            slider("spacing", tr("Spacing"), 1, 200, "{:d} %"),
+            slider("angle", tr("Angle"), 0, 359, "{:d}°"),
+            slider("roundness", tr("Roundness"), 5, 100, "{:d} %"),
+            slider("scatter", tr("Scatter"), 0, 300, "{:d} %"),
+            slider("size_jitter", tr("Size jitter"), 0, 100, "{:d} %"),
+            slider("opacity_jitter", tr("Opacity jitter"), 0, 100, "{:d} %"),
+            slider("count", tr("Count"), 1, 8),
+        ]
+        Slider.align(sliders)
+        settings_column.add(
+            Label(tr("Tip"), style="caption", uppercase=True),
+            Segmented([tr(t.title()) for t in tip_names], index, lambda i: tweak(tip=tip_names[i])),
+            Spacer(4),
+            *sliders,
+        )
+        settings_column.invalidate()
+
+    def define_tip() -> None:
+        doc = editor.doc
+        if doc is None:
+            return
+        piece = doc.copy_selection()
+        if piece is None or piece[0].getbbox() is None:
+            editor.notify(tr("Select something with pixels to use as a brush tip"))
+            return
+        tweak(tip="custom", texture=brushes_mod.texture_from_image(piece[0]))
+        rebuild_settings()
+        editor.notify(tr("Brush tip taken from the selection"), error=False)
+
+    def save() -> None:
+        new_name = name_field.value.strip()
+        if not new_name:
+            editor.notify(tr("Give the brush a name first"))
+            return
+        if library.is_builtin(new_name):
+            editor.notify(tr("'{name}' is a built-in brush - choose another name").format(name=new_name))
+            return
+        saved = library.save(replace(state["preset"], name=new_name))
+        select(saved)
+        editor.notify(tr("Saved brush '{name}'").format(name=new_name), error=False)
+
+    def delete() -> None:
+        current = state["preset"]
+        if library.is_builtin(current.name) or current.name not in library.user:
+            editor.notify(tr("Built-in brushes cannot be deleted"))
+            return
+        library.delete(current.name)
+        select(library.get(tool.default_preset))
+
+    rebuild_rows()
+    rebuild_settings()
+    items: list[Widget] = [
+        Label(tr("Brushes"), style="title"),
+        Label(tr("Pick a preset, then tune it below - changes apply to the tool right away"), style="muted"),
+        Spacer(6),
+        rows_column,
+        Spacer(8),
+        settings_column,
+        Spacer(8),
+        Row([Button(tr("Tip from selection"), define_tip, small=True), Spacer()], gap=8, height=30),
+        Spacer(4),
+        Row([name_field, Button(tr("Save"), save, small=True), Button(tr("Delete"), delete, small=True, danger=True)], gap=8, height=40),
+        Spacer(8),
+        Row([Spacer(), Button(tr("Done"), editor.dismiss_modal, primary=True)], gap=8, height=34),
+    ]
+    panel = Panel(Column(items), editor.sheet_place(420), padding=22, fit_height=False, modal=True, name=name, scrollable=True)
+    panel.default_action = editor.dismiss_modal  # type: ignore[attr-defined]
+    editor.open_sheet(panel)
+
+
+# ---------------------------------------------------------------------- 3D --
+def three_d_sheet(editor, index: int, created: bool = False) -> None:
+    """All settings of a 3D object layer with a quick live preview; Cancel on a freshly *created* layer removes it again."""
+    doc = editor.doc
+    if doc is None:
+        return
+    original = doc.scene_of(index)
+    if original is None:
+        return
+    layer_id = doc.layers[index].id
+    state: dict[str, Any] = {"scene": original, "generation": 0, "job": None}
+    name = "3d"
+
+    def preview_now() -> None:
+        state["job"] = None
+        if editor.doc is not doc or editor.sheet is None or editor.sheet.name != name:
+            return
+        scene: Scene = state["scene"]
+        state["generation"] += 1
+        generation = state["generation"]
+        size = doc.size
+
+        def job() -> Image.Image:
+            return three_d.render(scene, size, supersample=1, scale=0.5).resize(size, Image.Resampling.BILINEAR)
+
+        def show(image: Image.Image) -> None:
+            if generation == state["generation"] and editor.sheet is not None and editor.sheet.name == name:
+                editor.begin_preview(layer_id, image)
+
+        editor.worker.submit("3d-preview", job, show)
+
+    def schedule() -> None:
+        if state["job"] is not None:
+            editor.shell.after_cancel(state["job"])
+        state["job"] = editor.shell.after(80, preview_now)
+
+    def tweak(**changes: Any) -> None:
+        state["scene"] = replace(state["scene"], **changes).normalized()
+        schedule()
+
+    def slider(label: str, lo: int, hi: int, value: float, setter: Callable[[float], None], fmt: str = "{:d}") -> Slider:
+        return Slider(label, lo, hi, value, value, on_change=setter, fmt=fmt, compact=True)
+
+    def signed(degrees: float) -> float:
+        """Angles are shown as -180 … 180 so the neutral 0° sits in the middle of the track."""
+        return (degrees + 180) % 360 - 180
+
+    def rot(axis: int) -> Callable[[float], None]:
+        def set_rotation(v: float) -> None:
+            rotation = list(state["scene"].rotation)
+            rotation[axis] = float(v) % 360
+            tweak(rotation=tuple(rotation))
+
+        return set_rotation
+
+    def light(axis: int) -> Callable[[float], None]:
+        def set_light(v: float) -> None:
+            current = list(state["scene"].light)
+            current[axis] = float(v) % 360 if axis == 0 else float(v)
+            tweak(light=tuple(current))
+
+        return set_light
+
+    dot = ColorDot((*original.color, 255))
+
+    def pick_colour() -> None:
+        chosen = editor.shell.ask_color((*state["scene"].color, 255))
+        if chosen is not None:
+            dot.set_color(chosen)
+            tweak(color=tuple(chosen[:3]))
+
+    shapes = [sh for sh in three_d.SHAPES if sh != "extrusion" or original.shape == "extrusion"]
+    scene0 = original
+    sliders = [
+        slider(tr("Size"), 10, max(2000, int(scene0.size)), scene0.size, lambda v: tweak(size=float(v)), "{:d} px"),
+        slider(tr("Depth"), 1, 200, scene0.depth, lambda v: tweak(depth=int(v)), "{:d} %"),
+        slider(tr("Rotate X"), -180, 180, signed(scene0.rotation[0]), rot(0), "{:+d}°"),
+        slider(tr("Rotate Y"), -180, 180, signed(scene0.rotation[1]), rot(1), "{:+d}°"),
+        slider(tr("Rotate Z"), -180, 180, signed(scene0.rotation[2]), rot(2), "{:+d}°"),
+        slider(tr("Light direction"), -180, 180, signed(scene0.light[0]), light(0), "{:+d}°"),
+        slider(tr("Light height"), -89, 89, scene0.light[1], light(1), "{:+d}°"),
+        slider(tr("Ambient"), 0, 100, scene0.ambient, lambda v: tweak(ambient=int(v)), "{:d} %"),
+        slider(tr("Shininess"), 1, 128, scene0.shininess, lambda v: tweak(shininess=int(v))),
+        slider(tr("Specular"), 0, 100, scene0.specular, lambda v: tweak(specular=int(v)), "{:d} %"),
+        slider(tr("Detail"), 6, 96, scene0.segments, lambda v: tweak(segments=int(v))),
+    ]
+    Slider.align(sliders)
+    items: list[Widget] = [
+        Label(tr("3D Object"), style="title"),
+        Label(tr("Rotate, light and colour the object - it stays editable on its layer"), style="muted"),
+        Spacer(6),
+        Segmented([tr(sh.title()) for sh in shapes], shapes.index(scene0.shape), lambda i: tweak(shape=shapes[i])),
+        Spacer(4),
+        *sliders,
+        Row([Label(tr("Colour"), width=70), dot, Button(tr("Pick…"), pick_colour, small=True), Spacer()], gap=8, height=30),
+        Toggle(tr("Wireframe"), scene0.wireframe, lambda v: tweak(wireframe=bool(v))),
+        Spacer(10),
+    ]
+
+    def stop() -> None:
+        if state["job"] is not None:
+            editor.shell.after_cancel(state["job"])
+            state["job"] = None
+        state["generation"] += 1
+        editor.worker.cancel("3d-preview")
+
+    def cancel() -> None:
+        stop()
+        editor.dismiss_modal()
+        if created:
+            layer_index = doc.layer_index(layer_id)
+            if layer_index is not None and len(doc.layers) > 1:
+                doc.set_active(layer_index)
+                doc.remove_layer(layer_index)
+                editor.after_edit()
+
+    def apply() -> None:
+        stop()
+        scene: Scene = state["scene"]
+        editor.dismiss_modal()
+        layer_index = doc.layer_index(layer_id)
+        if layer_index is None or scene == original:
+            return
+        editor.doc_op(lambda d: d.update_3d_layer(layer_index, scene=scene, label="Edit 3D Object"))
+
+    items.append(Row([Spacer(), Button(tr("Cancel"), cancel), Button(tr("OK"), apply, primary=True)], gap=8, height=34))
+    panel = Panel(Column(items), editor.sheet_place(440), padding=22, fit_height=False, modal=True, name=name, scrollable=True)
+    panel.default_action = apply  # type: ignore[attr-defined]
+    panel.on_dismiss = stop  # type: ignore[attr-defined]
+    editor.open_sheet(panel)
 
 
 # ------------------------------------------------------------------- help --

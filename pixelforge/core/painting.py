@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
+from .brushes import BrushPreset
 from .color import parse_color
 
 Point = tuple[float, float]
@@ -48,34 +50,72 @@ def brush_stamp(diameter: int, hardness: float = 0.8) -> np.ndarray:
 
 
 class Stroke:
-    """Incrementally accumulates brush coverage for one mouse-down/up gesture."""
+    """Incrementally accumulates brush coverage for one mouse-down/up gesture.
 
-    def __init__(self, size: tuple[int, int], diameter: int, hardness: float = 0.8, spacing: float = 0.15) -> None:
+    Dabs follow a :class:`~pixelforge.core.brushes.BrushPreset`: tip shape,
+    spacing, scatter, size / opacity jitter and flow.  ``Stroke(size, diameter,
+    hardness)`` still works and means a plain round brush.
+    """
+
+    def __init__(
+        self,
+        size: tuple[int, int],
+        diameter: int | None = None,
+        hardness: float = 0.8,
+        spacing: float = 0.15,
+        preset: BrushPreset | None = None,
+        seed: int | None = None,
+    ) -> None:
         self.width, self.height = size
-        self.diameter = max(1, int(diameter))
-        self.hardness = hardness
-        self.spacing = max(0.5, self.diameter * spacing)
+        if preset is None:
+            preset = BrushPreset(
+                "Round", "round", max(1, int(diameter or 24)), int(round(hardness * 100)), max(1, int(round(spacing * 100)))
+            )
+        self.preset = preset.normalized()
+        self.diameter = self.preset.size
+        self.hardness = self.preset.hardness / 100
+        self.spacing = max(0.5, self.diameter * self.preset.spacing / 100)
         self.coverage = np.zeros((self.height, self.width), np.float32)
+        self._rng = random.Random(seed)
         self._last: Point | None = None
         self._carry = 0.0
         self.dirty: tuple[int, int, int, int] | None = None  # bbox of touched pixels
 
     # --------------------------------------------------------------------
-    def _stamp(self, x: float, y: float) -> None:
-        stamp = brush_stamp(self.diameter, self.hardness)
-        d = self.diameter
+    def _dab(self, x: float, y: float, stamp: np.ndarray, strength: float) -> None:
+        d = stamp.shape[0]
         left, top = int(round(x - d / 2)), int(round(y - d / 2))
         x0, y0 = max(left, 0), max(top, 0)
         x1, y1 = min(left + d, self.width), min(top + d, self.height)
         if x1 <= x0 or y1 <= y0:
             return
         region = self.coverage[y0:y1, x0:x1]
-        np.maximum(region, stamp[y0 - top : y1 - top, x0 - left : x1 - left], out=region)
+        piece = stamp[y0 - top : y1 - top, x0 - left : x1 - left]
+        if strength >= 0.999:
+            np.maximum(region, piece, out=region)
+        else:
+            region += piece * np.float32(strength) * (1 - region)  # flow: dabs build up where they overlap
         if self.dirty is None:
             self.dirty = (x0, y0, x1, y1)
         else:
             a, b, c, e = self.dirty
             self.dirty = (min(a, x0), min(b, y0), max(c, x1), max(e, y1))
+
+    def _stamp(self, x: float, y: float) -> None:
+        p = self.preset
+        rng = self._rng
+        for _ in range(p.count):
+            size = p.size
+            if p.size_jitter:
+                size = max(1, int(round(p.size * (1 - rng.random() * p.size_jitter / 100))))
+            dx = dy = 0.0
+            if p.scatter:
+                reach = p.size * p.scatter / 100
+                dx, dy = (rng.random() * 2 - 1) * reach, (rng.random() * 2 - 1) * reach
+            strength = p.flow / 100
+            if p.opacity_jitter:
+                strength *= 1 - rng.random() * p.opacity_jitter / 100
+            self._dab(x + dx, y + dy, p.stamp(size), strength)
 
     def add_point(self, x: float, y: float) -> None:
         """Extend the stroke to (x, y), stamping along the segment at fixed spacing."""

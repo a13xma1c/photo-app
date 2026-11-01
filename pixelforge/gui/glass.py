@@ -759,3 +759,15 @@ def _folder(d, x, y, s, col):
     w = _w(s)
     d.rounded_rectangle((x - r, y - r * 0.55, x + r, y + r * 0.7), radius=r * 0.2, outline=col, width=w)
     _line(d, [(x - r, y - r * 0.55), (x - r, y - r * 0.85), (x - r * 0.3, y - r * 0.85), (x - r * 0.05, y - r * 0.55)], s, col)
+
+
+@_icon("cube")
+def _cube(d, x, y, s, col):
+    r = s * 0.4
+    w = _w(s)
+    top = (x, y - r)
+    left, right, bottom = (x - r * 0.87, y - r * 0.5), (x + r * 0.87, y - r * 0.5), (x, y)
+    lb, rb, bb = (x - r * 0.87, y + r * 0.5), (x + r * 0.87, y + r * 0.5), (x, y + r)
+    d.polygon([top, right, bottom, left], outline=col, width=w)
+    d.polygon([left, bottom, bb, lb], outline=col, width=w)
+    d.polygon([bottom, right, rb, bb], outline=col, width=w)

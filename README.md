@@ -31,7 +31,7 @@ tree of panes and controls.
 | Top-left | Open, Save project, Export picture, Undo, Redo, Revert, **Compare** with the original (or hold `\`) |
 | Top-centre | Options of the active tool (brush size, selection mode, gradient type, …) |
 | Top-right | File name, size, unsaved marker, **⋯** menu |
-| Left strip | 17 tools in two columns, foreground/background colours, rotate and flip |
+| Left strip | 18 tools in two columns, foreground/background colours, rotate and flip |
 | Right panel | **Adjust** – histogram, *Auto*, 16 sliders in three groups · **Presets** – built-in looks and your own · **Layers** – thumbnails, masks, groups, visibility, blend mode, opacity, reorder, merge, effects, lock · **History** – steps and named snapshots |
 | Bottom | Zoom controls (click the percentage for a menu), info pill with tool hints, cursor position and colour readout |
 
@@ -43,11 +43,12 @@ tree of panes and controls.
 | Free Transform | `Ctrl+T` | scale / rotate / move / flip the layer or the selected pixels with handles and numeric fields; Shift keeps the aspect, Alt scales from the centre |
 | Marquee / Lasso / Magic Wand | `M` `L` `W` | rectangle or ellipse, freehand, colour-based; Shift adds, Alt subtracts; feather, tolerance, contiguous; marching ants |
 | Crop | `C` | handles, aspect ratios, rule-of-thirds, snapping to edges/thirds/grid, Enter/Esc |
-| Brush / Eraser | `B` `E` | soft round brush with live preview, `[` `]` size, Shift-click lines; paints on the layer mask when that is the edit target |
+| Brush / Eraser | `B` `E` | brush presets with tips (round, square, chalk, spatter, custom from a selection), spacing, angle, roundness, scatter, size/opacity jitter, flow and count; `[` `]` size, Shift-click lines; paints on the layer mask when that is the edit target |
 | Clone Stamp / Healing Brush | `S` `J` | Alt-click picks the source; aligned or not, from one or all layers; the healing brush keeps the surroundings' colour and spot-heals without a source |
 | Paint Bucket / Gradient | `G` `⇧G` | tolerance fill or whole selection; linear, radial, reflected gradients |
 | Text | `T` | system fonts, size, colour, outline; text layers stay editable (double-click in Layers) |
 | Shape | `U` | rectangle, ellipse, line with fill and stroke |
+| 3D | `K` | rotates (drag), moves (Shift) and scales (Alt) the 3D object of the active layer; double-click opens all settings |
 | Eyedropper | `I` | picks the foreground (Alt: background) colour |
 | Zoom / Hand | `Z` `H` | plus Space-drag, pinch and ⌘-wheel everywhere |
 
@@ -72,6 +73,32 @@ the Select menu offers feather, grow, shrink, border, invert and crop-to-selecti
 * **Tones** – *Image ▸ Curves…* (`Ctrl+M`) edits a master RGB curve and the
   three channels over the layer's histogram; *Levels…* (`Ctrl+L`) has draggable
   black / grey / white input markers and an output range.
+
+### Brushes
+
+The brush button in the options bar of the Brush, Eraser, Clone Stamp and
+Healing Brush opens the brush picker: eleven built-in presets (hard and soft
+round, airbrush, pencil, marker, calligraphy, square, chalk, spatter,
+watercolour, stipple) with a stroke sample each, plus your own. Every preset
+has a tip shape, size, hardness, spacing, angle, roundness, scatter, size and
+opacity jitter, flow (low flow builds up like an airbrush) and dabs per step.
+*Tip from selection* turns the selected pixels into a custom tip; presets are
+saved to `~/.pixelforge/brushes.json`.
+
+### 3D objects
+
+*Layer ▸ New 3D Object…* adds a 3D layer - cube, sphere, cylinder, cone, torus
+or pyramid - rendered by PixelForge's own software renderer (perspective,
+smooth Blinn-Phong shading, adjustable light, anti-aliasing, optional
+wireframe). *Extrude Layer to 3D* turns the opaque pixels of any layer - a
+text layer, a logo, a selection - into a textured 3D extrusion. The 3D tool
+(`K`) rotates, moves and scales the object directly on the canvas with a quick
+preview rendered in the background; the object stays editable on its layer and
+is stored in project files. 3D and text layers are *smart*: filters and curves
+applied to them are kept as a stack and re-applied whenever the layer is
+re-rendered, Move and Free Transform change the object rather than its pixels,
+and *Layer ▸ Rasterize Layer* converts them to ordinary pixels when you want
+to paint on them.
 
 ### Menus and sheets
 
@@ -157,6 +184,7 @@ image pixel per physical screen pixel, like in Photoshop.
 | `Ctrl+T` | Free Transform |
 | `Ctrl+L` / `Ctrl+M` | Levels / Curves |
 | `S` / `J` | Clone Stamp / Healing Brush (Alt-click picks the source) |
+| `K` | 3D tool (drag rotates, Shift moves, Alt scales) |
 | `Ctrl+[` / `Ctrl+]` | Rotate left / right |
 | `Enter` / `Esc` | Apply / cancel the current tool action or sheet |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` / `Ctrl+1` / `Ctrl+2` | Zoom in / out / fit / 100 % / fit width |
@@ -195,14 +223,15 @@ save_image(doc, "out.png")
 ```
 pixelforge/
 ├── core/          image engine (no GUI): document, layers/masks/groups, adjustments, curves,
-│                  effects, painting (brush, clone/heal, transform), colorspace, history, io, ...
+│                  effects, brushes, painting (strokes, clone/heal, transform), three_d (meshes,
+│                  software renderer, extrusions), colorspace, history, io, ...
 ├── gui/
 │   ├── theme.py   colours, fonts, metrics, UI scale
 │   ├── glass.py   anti-aliased shapes, frosted-glass panels, vector icons (Pillow)
 │   ├── ui.py      widget kit: Column/Row, Label, Button, IconButton, Segmented, Slider,
 │   │              Toggle, ListItem, NumberField, Panel
 │   ├── surface.py picture rendering, panel compositing, event routing, tooltips
-│   ├── tools.py   the 17 interactive tools
+│   ├── tools.py   the 18 interactive tools
 │   ├── worker.py  background thread for composites and previews (latest request wins)
 │   ├── accessibility.py  accessible-object tree for assistive technology
 │   ├── fonts/     bundled DejaVu Sans (see LICENSE-DejaVu.txt)

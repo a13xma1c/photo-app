@@ -22,6 +22,7 @@ from typing import Any, Protocol
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
+from ..core.document import DocumentError
 from . import glass, theme
 from .theme import METRICS, PALETTE, font, px
 from .ui import DrawContext, Panel, Segmented, Widget
@@ -507,6 +508,9 @@ class Surface:
         self._render_job = None
         self.render_count += 1
         vw, vh = self.viewport_size()
+        for panel in self.panels:
+            if panel.needs_layout:
+                panel.layout(vw, vh)
         frame_changed = self._frame_dirty or self._frame is None or self._frame.size != (vw, vh)
         if frame_changed:
             self._frame = self.compose_frame()
@@ -579,6 +583,11 @@ class Surface:
         """Run a tool/widget callback; unexpected errors are reported instead of killing the event loop."""
         try:
             fn()
+        except DocumentError as exc:  # an edit the document refuses: tell the user, no traceback
+            notify = getattr(self.app, "notify", None)
+            if notify is None:
+                raise
+            notify(str(exc))
         except Exception as exc:  # noqa: BLE001 - the app must survive any tool bug
             report = getattr(self.app, "report_error", None)
             if report is None:

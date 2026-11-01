@@ -17,7 +17,8 @@ import math
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageChops, ImageOps
@@ -35,10 +36,13 @@ from .filters import apply_filter
 from .history import History
 from .layers import Layer, ensure_rgba, mask_to_rgba, rgba_to_mask
 from .selection import Selection
+from .three_d import Scene, extrusion_scene
+from .three_d import render as render_scene
 
 Box = tuple[int, int, int, int]
 ANCHORS: tuple[str, ...] = ("nw", "n", "ne", "w", "center", "e", "sw", "s", "se")
 MAX_DIMENSION = 20000
+SMART_KINDS: tuple[str, ...] = ("3d", "text")  # layers re-rendered from their meta: filters on them stay live
 HISTORY_BUDGET_BYTES = 1_500_000_000  # undo states are dropped (oldest first) once they hold more than this
 HISTORY_MIN_STEPS, HISTORY_MAX_STEPS = 8, 100
 PATCH_MAX_FRACTION = 0.6  # an older image is kept as a patch when the changed area is at most this share of it
@@ -1123,6 +1127,8 @@ class Document:
         layer = self._require_unlocked(index)
         if layer.kind == "adjustment":
             raise DocumentError("an adjustment layer has no pixels - merge it down to bake it")
+        if layer.kind in SMART_KINDS:
+            raise DocumentError("adjustments stay live on 3D and text layers - rasterize the layer to bake them")
         if not layer.has_adjustments:
             return
         rendered = apply_adjustments(layer.image, layer.adjustments, doc_size=self.size)
@@ -1247,9 +1253,22 @@ class Document:
         self._record("Load Mask as Selection", replace=True)
 
     # ------------------------------------------------------------ pixel edits --
+    def is_smart(self, index: int | None = None) -> bool:
+        """True for layers whose picture is rendered from their settings (3D objects, text)."""
+        index = self._check_index(index)
+        return self.layers[index].kind in SMART_KINDS
+
+    def _require_pixels(self, index: int) -> Layer:
+        """Like :meth:`_require_unlocked` but also refuses smart layers, whose pixels would be lost on the next render."""
+        layer = self._require_unlocked(index, pixels=True)
+        if layer.kind in SMART_KINDS:
+            what = "3D object" if layer.kind == "3d" else "text layer"
+            raise DocumentError(f"'{layer.name}' is a {what} - rasterize it (Layer ▸ Rasterize Layer) to paint on its pixels")
+        return layer
+
     def apply_to_active(self, fn: Callable[[Image.Image], Image.Image], label: str, respect_selection: bool = True) -> None:
         """Replace the active layer's pixels - or its mask while :attr:`editing_mask` - with ``fn(image)`` (limited to the selection)."""
-        layer = self._require_unlocked(self.active_index, pixels=not self.editing_mask)
+        layer = self._require_unlocked(self.active_index, pixels=False) if self.editing_mask else self._require_pixels(self.active_index)
         result = self.preview_active(fn, respect_selection)
         if self.editing_mask:
             self.layers[self.active_index] = layer.copy(mask=rgba_to_mask(result))
@@ -1270,11 +1289,86 @@ class Document:
         return result
 
     def apply_filter(self, name: str, **params) -> None:
+        """Run a filter on the active layer; on 3D / text layers it becomes a *smart filter* that survives re-rendering."""
+        if self.is_smart() and not self.editing_mask:
+            self.add_smart_filter({"kind": "filter", "name": name, "params": dict(params)}, name)
+            return
         self.apply_to_active(lambda im: apply_filter(im, name, **params), name)
 
     def apply_curves(self, curves: Mapping[str, Sequence[Sequence[float]]], label: str = "Curves") -> None:
         """Remap tones of the active layer through per-channel curves (see :mod:`pixelforge.core.curves`)."""
+        if self.is_smart() and not self.editing_mask:
+            self.add_smart_filter({"kind": "curves", "curves": {k: [list(p) for p in v] for k, v in curves.items()}}, label)
+            return
         self.apply_to_active(lambda im: apply_curves(im, curves), label)
+
+    # ---------------------------------------------------------- smart layers --
+    @staticmethod
+    def apply_smart_filters(image: Image.Image, filters: Sequence[Mapping[str, Any]]) -> Image.Image:
+        """Run the recorded filter stack over a freshly rendered picture."""
+        for entry in filters:
+            if entry.get("kind") == "curves":
+                image = apply_curves(image, entry.get("curves") or {})
+            else:
+                image = apply_filter(image, str(entry.get("name")), **dict(entry.get("params") or {}))
+        return ensure_rgba(image)
+
+    def smart_filters(self, index: int | None = None) -> list[dict[str, Any]]:
+        index = self._check_index(index)
+        return [dict(f) for f in self.layers[index].meta.get("filters") or []]
+
+    def render_smart(self, index: int, meta: Mapping[str, Any] | None = None) -> Image.Image:
+        """The picture of a smart layer: its 3D scene or text rendered, then its filter stack applied."""
+        layer = self.layers[index]
+        meta = layer.meta if meta is None else meta
+        if layer.kind == "3d":
+            base = self.render_3d(Scene.from_dict(meta["3d"]))
+        elif layer.kind == "text":
+            base = painting.render_text(
+                self.size,
+                tuple(meta["position"]),
+                meta["text"],
+                tuple(meta["color"]),
+                meta.get("font_name"),
+                meta.get("font_size", 32),
+                stroke_width=meta.get("stroke_width", 0),
+                stroke_color=tuple(meta["stroke_color"]) if meta.get("stroke_color") else None,
+            )
+        else:
+            raise DocumentError("not a smart layer")
+        return self.apply_smart_filters(base, meta.get("filters") or [])
+
+    def add_smart_filter(self, entry: Mapping[str, Any], label: str, index: int | None = None) -> None:
+        index = self._check_index(index)
+        layer = self._require_unlocked(index)
+        if layer.kind not in SMART_KINDS:
+            raise DocumentError("smart filters need a 3D or text layer")
+        filters = [*(layer.meta.get("filters") or []), dict(entry)]
+        meta = {**layer.meta, "filters": filters}
+        self.layers[index] = layer.copy(image=self.render_smart(index, meta), meta=meta)
+        self.commit(label)
+
+    def clear_smart_filters(self, index: int | None = None) -> None:
+        """Remove every smart filter from a 3D / text layer (the picture goes back to the plain render)."""
+        index = self._check_index(index)
+        layer = self._require_unlocked(index)
+        if not layer.meta.get("filters"):
+            return
+        meta = {k: v for k, v in layer.meta.items() if k != "filters"}
+        self.layers[index] = layer.copy(image=self.render_smart(index, meta), meta=meta)
+        self.commit("Remove Smart Filters")
+
+    def rasterize_layer(self, index: int | None = None) -> Layer:
+        """Turn a 3D / text layer into an ordinary pixel layer (its settings are dropped, the pixels stay)."""
+        index = self._check_index(index)
+        layer = self._require_unlocked(index)
+        if layer.kind not in SMART_KINDS:
+            raise DocumentError("only 3D and text layers can be rasterized")
+        keep = {k: v for k, v in layer.meta.items() if k in ("group", "effects")}
+        name = layer.name[2:] if layer.kind == "text" and layer.name.startswith("T ") else layer.name
+        self.layers[index] = layer.copy(kind="pixel", meta=keep, name=name)
+        self.commit(f"Rasterize '{name}'")
+        return self.layers[index]
 
     def fill(self, color, opacity: float = 1.0, label: str = "Fill") -> None:
         mask = self.selection_mask()
@@ -1321,8 +1415,26 @@ class Document:
         )
 
     def offset_active(self, dx: int, dy: int, label: str = "Move") -> None:
-        """Move the active layer's pixels (mask linked) - or only its mask while :attr:`editing_mask`."""
+        """Move the active layer's pixels (mask linked) - or only its mask while :attr:`editing_mask`.
+
+        3D and text layers move through their settings so they stay editable.
+        """
         if dx == 0 and dy == 0:
+            return
+        layer = self.active_layer
+        if layer.kind in SMART_KINDS and not self.editing_mask:
+            self._require_unlocked(self.active_index)
+            if layer.kind == "3d":
+                scene = self.scene_of()
+                assert scene is not None
+                self.update_3d_layer(scene=replace(scene, position=(scene.position[0] + dx, scene.position[1] + dy)), label=label)
+            else:
+                x, y = layer.meta["position"]
+                self.update_text_layer(position=[float(x + dx), float(y + dy)], label=label)
+            if layer.mask is not None:
+                moved = self.layers[self.active_index]
+                self.layers[self.active_index] = moved.copy(mask=painting.offset_image(moved.mask, dx, dy))  # type: ignore[arg-type]
+                self._record(label, replace=True)
             return
         self.apply_to_active(lambda im: painting.offset_image(im, dx, dy), label, respect_selection=False)
         layer = self.active_layer
@@ -1352,26 +1464,17 @@ class Document:
         layer = Layer(image, f"T {label}", kind="text", meta=meta)
         return self.add_layer(layer)
 
-    def update_text_layer(self, index: int | None = None, **changes) -> Layer:
-        """Re-render a text layer with changed text/font/colour/position."""
+    def update_text_layer(self, index: int | None = None, label: str = "Edit Text", **changes) -> Layer:
+        """Re-render a text layer with changed text/font/colour/position (its smart filters are re-applied)."""
         index = self._check_index(index)
         layer = self._require_unlocked(index)
         if layer.kind != "text":
             raise DocumentError("not a text layer")
         meta = {**layer.meta, **changes}
-        image = painting.render_text(
-            self.size,
-            tuple(meta["position"]),
-            meta["text"],
-            tuple(meta["color"]),
-            meta.get("font_name"),
-            meta.get("font_size", 32),
-            stroke_width=meta.get("stroke_width", 0),
-            stroke_color=tuple(meta["stroke_color"]) if meta.get("stroke_color") else None,
-        )
-        label = meta["text"].splitlines()[0][:20] if meta["text"].strip() else "Text"
-        self.layers[index] = layer.copy(image=image, meta=meta, name=f"T {label}")
-        self.commit("Edit Text")
+        image = self.render_smart(index, meta)
+        title = meta["text"].splitlines()[0][:20] if meta["text"].strip() else "Text"
+        self.layers[index] = layer.copy(image=image, meta=meta, name=f"T {title}")
+        self.commit(label)
         return self.layers[index]
 
     # ----------------------------------------------------- free transform --
@@ -1414,6 +1517,9 @@ class Document:
         if transform.is_identity:
             return
         layer = self._require_unlocked(self.active_index, pixels=not self.editing_mask)
+        if layer.kind in SMART_KINDS and not self.editing_mask:
+            self._transform_smart(layer, transform, label)
+            return
         if self.editing_mask:
             assert layer.mask is not None
             new_layer = layer.copy(mask=self._transformed_piece(transform, layer.mask))
@@ -1425,6 +1531,95 @@ class Document:
             moved = self.selection.transformed(lambda m: painting.transform_image(m, transform))
             self.selection = None if moved.is_empty else moved
         self.commit(label)
+
+    def _transform_smart(self, layer: Layer, transform: painting.Transform, label: str) -> None:
+        """Free Transform of a 3D / text layer changes its settings (size, position, rotation) instead of its pixels."""
+        scale_factor = (abs(transform.scale_x) + abs(transform.scale_y)) / 2
+        cx, cy = transform.center
+        new_cx, new_cy = transform.apply(cx, cy)
+        if layer.kind == "3d":
+            scene = self.scene_of()
+            assert scene is not None
+            rx, ry, rz = scene.rotation
+            self.update_3d_layer(
+                scene=replace(
+                    scene,
+                    size=scene.size * scale_factor,
+                    position=(scene.position[0] + new_cx - cx, scene.position[1] + new_cy - cy),
+                    rotation=(rx, ry, rz + transform.angle),
+                ),
+                label=label,
+            )
+            return
+        x, y = layer.meta["position"]
+        # scale the text about the transform's pivot, then move it like the pivot moved
+        nx = cx + (x - cx) * scale_factor + (new_cx - cx)
+        ny = cy + (y - cy) * scale_factor + (new_cy - cy)
+        size = max(4, int(round(layer.meta.get("font_size", 32) * scale_factor)))
+        self.update_text_layer(position=[float(nx), float(ny)], font_size=size, label=label)
+
+    # ------------------------------------------------------------ 3D layers --
+    def render_3d(self, scene: Scene, scale: float = 1.0, supersample: int = 2) -> Image.Image:
+        """Render *scene* for this document (at *scale* of its size; use a small scale for quick previews)."""
+        return render_scene(scene, self.size, supersample=supersample, scale=scale)
+
+    def add_3d_layer(self, scene: Scene | None = None, name: str | None = None) -> Layer:
+        """Add a 3D object layer: its picture is rendered from the :class:`Scene` kept in ``meta["3d"]``."""
+        scene = (scene or Scene()).normalized()
+        image = self.render_3d(scene)
+        layer = Layer(image, name or f"3D {scene.shape.title()}", kind="3d", meta={"3d": scene.to_dict()})
+        return self.add_layer(layer, commit=True)
+
+    def scene_of(self, index: int | None = None) -> Scene | None:
+        index = self._check_index(index)
+        layer = self.layers[index]
+        if layer.kind != "3d" or "3d" not in layer.meta:
+            return None
+        return Scene.from_dict(layer.meta["3d"])
+
+    def update_3d_layer(
+        self,
+        index: int | None = None,
+        scene: Scene | None = None,
+        label: str = "Edit 3D Object",
+        image: Image.Image | None = None,
+        **changes,
+    ) -> Layer:
+        """Re-render a 3D layer with a new *scene* (or field *changes*) and record it; *image* skips the render."""
+        index = self._check_index(index)
+        layer = self._require_unlocked(index)
+        current = self.scene_of(index)
+        if current is None:
+            raise DocumentError("not a 3D layer")
+        new_scene = scene or current
+        if changes:
+            new_scene = replace(new_scene, **changes)
+        new_scene = new_scene.normalized()
+        if image is None or image.size != self.size:
+            image = self.render_3d(new_scene)
+        filters = layer.meta.get("filters") or []
+        if filters:
+            image = self.apply_smart_filters(image, filters)
+        self.layers[index] = layer.copy(image=image, meta={**layer.meta, "3d": new_scene.to_dict()})
+        self.commit(label)
+        return self.layers[index]
+
+    def extrude_layer(self, index: int | None = None, depth: int = 30) -> Layer:
+        """Turn the opaque pixels of a layer into a textured 3D extrusion on a new layer above it."""
+        index = self._check_index(index)
+        source = self.layers[index]
+        if source.kind in ("group", "adjustment"):
+            raise DocumentError("only layers with pixels can be extruded")
+        image = source.masked_image()
+        if self.selection is not None and not self.selection.is_empty:
+            image = image.copy()
+            image.putalpha(ImageChops.multiply(image.getchannel("A"), self.selection.mask))
+        try:
+            scene = extrusion_scene(image, depth)
+        except ValueError as exc:
+            raise DocumentError(str(exc)) from exc
+        self.active_index = index
+        return self.add_3d_layer(scene, name=f"3D {source.name}")
 
     # ---------------------------------------------------------- transforms --
     def _transform_all(
