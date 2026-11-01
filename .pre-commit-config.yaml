@@ -1,0 +1,32 @@
+# Install once with `uv run pre-commit install`; every commit is then linted, formatted and type-checked.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.13
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        files: \.py$
+      - id: pytest-quick
+        name: pytest (engine, no GUI)
+        entry: uv run pytest -q -m "not gui" -x
+        language: system
+        pass_filenames: false
+        files: \.py$
